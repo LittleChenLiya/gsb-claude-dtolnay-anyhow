@@ -123,6 +123,50 @@ anyhow = "1.0"
 
 <br>
 
+## Chain index
+
+`Error::chain_index` builds an explicit, read-only index over an error's
+chain. The index distinguishes context layers from the underlying cause,
+queries layers by real type identity (`TypeId`) rather than message text,
+keeps multiple same-type contexts in order, follows custom `source()` chains
+with a finite guard against cycles, and never takes ownership of the error.
+Reports produced from the index record type identities only, never message
+values.
+
+A three-layer error chain — two context layers over an `io::Error` root
+cause:
+
+```rust
+use anyhow::{anyhow, Context, LayerKind};
+use std::io;
+
+let error = anyhow!(io::Error::new(io::ErrorKind::NotFound, "config.json"))
+    .context("loading configuration")
+    .context("starting service");
+
+let index = error.chain_index();
+assert_eq!(index.len(), 3);
+assert_eq!(index.layers()[0].kind(), LayerKind::Context);
+assert_eq!(index.layers()[2].kind(), LayerKind::Cause);
+
+// Both `&str` contexts keep their own identity, in chain order.
+let contexts = index.get_all::<&str>();
+assert_eq!(contexts, [&"starting service", &"loading configuration"]);
+
+// The underlying cause is still downcastable.
+let cause: &io::Error = index.get().unwrap();
+assert_eq!(cause.kind(), io::ErrorKind::NotFound);
+```
+
+Run the chain index test suite and documentation examples with:
+
+```console
+cargo test --test test_chain_index
+cargo test --doc ChainIndex
+```
+
+<br>
+
 ## No-std support
 
 In no_std mode, almost all of the same API is available and works the same way.

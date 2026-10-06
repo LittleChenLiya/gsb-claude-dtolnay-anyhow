@@ -255,6 +255,8 @@ mod context;
 mod ensure;
 mod error;
 mod fmt;
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+mod index;
 mod kind;
 mod macros;
 #[cfg(error_generic_member_access)]
@@ -415,6 +417,11 @@ pub struct Error {
 pub struct Chain<'a> {
     state: crate::chain::ChainState<'a>,
 }
+
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub use crate::index::{
+    ChainIndex, ChainReport, EmptyChain, Layer, LayerKind, LayerReport, MAX_CHAIN_DEPTH,
+};
 
 /// `Result<T, Error>`
 ///

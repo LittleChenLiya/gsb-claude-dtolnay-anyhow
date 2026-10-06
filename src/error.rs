@@ -1,5 +1,7 @@
 use crate::backtrace::Backtrace;
 use crate::chain::Chain;
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+use crate::index::LayerKind;
 #[cfg(error_generic_member_access)]
 use crate::nightly::{self, Request};
 #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
@@ -7,6 +9,8 @@ use crate::ptr::Mut;
 use crate::ptr::{Own, Ref};
 use crate::{Error, StdError};
 use alloc::boxed::Box;
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+use core::any::type_name;
 use core::any::TypeId;
 use core::fmt::{self, Debug, Display};
 use core::mem::ManuallyDrop;
@@ -155,6 +159,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<E>,
             object_downcast: object_downcast::<E>,
             object_drop_rest: object_drop_front::<E>,
+            object_layer: object_layer::<E>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -179,6 +184,8 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<MessageError<M>>,
             object_downcast: object_downcast::<M>,
             object_drop_rest: object_drop_front::<M>,
+            #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+            object_layer: adhoc_layer::<M>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -204,6 +211,8 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<DisplayError<M>>,
             object_downcast: object_downcast::<M>,
             object_drop_rest: object_drop_front::<M>,
+            #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+            object_layer: display_layer::<M>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -235,6 +244,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<ContextError<C, E>>,
             object_downcast: context_downcast::<C, E>,
             object_drop_rest: context_drop_rest::<C, E>,
+            object_layer: context_layer::<C, E>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -260,6 +270,7 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<BoxedError>,
             object_downcast: object_downcast::<Box<dyn StdError + Send + Sync>>,
             object_drop_rest: object_drop_front::<Box<dyn StdError + Send + Sync>>,
+            object_layer: boxed_layer,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
         };
@@ -372,6 +383,8 @@ impl Error {
             object_reallocate_boxed: object_reallocate_boxed::<ContextError<C, Error>>,
             object_downcast: context_chain_downcast::<C>,
             object_drop_rest: context_chain_drop_rest::<C>,
+            #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+            object_layer: context_chain_layer::<C>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: context_backtrace::<C>,
         };
@@ -440,6 +453,34 @@ impl Error {
     #[cold]
     pub fn chain(&self) -> Chain {
         unsafe { ErrorImpl::chain(self.inner.by_ref()) }
+    }
+
+    /// Builds an explicit, read-only index over this error's chain.
+    ///
+    /// The returned [`ChainIndex`][crate::ChainIndex] records every layer of
+    /// the chain &mdash; context layers and the underlying cause &mdash;
+    /// keyed by real type identity rather than message text, and never takes
+    /// ownership of the error. See [`ChainIndex`][crate::ChainIndex] for
+    /// details.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use anyhow::{anyhow, Context};
+    /// use std::io;
+    ///
+    /// let error = anyhow!(io::Error::new(io::ErrorKind::NotFound, "config.json"))
+    ///     .context("loading configuration")
+    ///     .context("starting service");
+    ///
+    /// let index = error.chain_index();
+    /// assert_eq!(index.len(), 3);
+    /// assert!(index.root_cause().unwrap().is::<io::Error>());
+    /// ```
+    #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+    #[cold]
+    pub fn chain_index(&self) -> crate::ChainIndex<'_> {
+        crate::ChainIndex::new(self)
     }
 
     /// The lowest level cause of this error &mdash; this error's cause's
@@ -728,8 +769,37 @@ struct ErrorVTable {
     object_reallocate_boxed: unsafe fn(Own<ErrorImpl>) -> Box<dyn StdError + Send + Sync + 'static>,
     object_downcast: unsafe fn(Ref<ErrorImpl>, TypeId) -> Option<Ref<()>>,
     object_drop_rest: unsafe fn(Own<ErrorImpl>, TypeId),
+    #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+    object_layer: unsafe fn(Ref<ErrorImpl>) -> LayerInfo,
     #[cfg(all(not(error_generic_member_access), feature = "std"))]
     object_backtrace: unsafe fn(Ref<ErrorImpl>) -> Option<&Backtrace>,
+}
+
+// Description of one layer of an error chain, used to build a
+// `crate::ChainIndex` without formatting any error message.
+//
+// `payload` is a type-erased pointer to the value that this layer contributes
+// to downcasting: the context `C` for context layers, or the error itself for
+// cause layers. `type_id` is the real type identity of that value.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub(crate) struct LayerInfo<'a> {
+    pub kind: LayerKind,
+    pub type_id: TypeId,
+    pub type_name: &'static str,
+    pub payload: Ref<'a, ()>,
+    // Next anyhow-owned layer below this one, if the cause is itself an
+    // anyhow::Error. `None` for the innermost layer.
+    pub next: Option<Ref<'a, ErrorImpl>>,
+    // For ContextError<C, E> where E is a plain std error: the type identity
+    // of E, which sits directly below the context layer.
+    pub inline_source: Option<TypedPayload<'a>>,
+}
+
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+pub(crate) struct TypedPayload<'a> {
+    pub type_id: TypeId,
+    pub type_name: &'static str,
+    pub payload: Ref<'a, ()>,
 }
 
 // Safety: requires layout of *e to match ErrorImpl<E>.
@@ -808,6 +878,128 @@ where
 fn no_backtrace(e: Ref<ErrorImpl>) -> Option<&Backtrace> {
     let _ = e;
     None
+}
+
+// Safety: requires layout of *e to match ErrorImpl<E>.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+unsafe fn object_layer<E>(e: Ref<ErrorImpl>) -> LayerInfo
+where
+    E: 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<E>>();
+    let object = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object) };
+    LayerInfo {
+        kind: LayerKind::Cause,
+        type_id: TypeId::of::<E>(),
+        type_name: type_name::<E>(),
+        payload: Ref::from_raw(unsafe { NonNull::new_unchecked(object.cast_mut()) }).cast::<()>(),
+        next: None,
+        inline_source: None,
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<MessageError<M>>.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+unsafe fn adhoc_layer<M>(e: Ref<ErrorImpl>) -> LayerInfo
+where
+    M: 'static,
+{
+    // Safety: MessageError is repr(transparent) so a pointer to the
+    // MessageError<M> is equally a pointer to the M it wraps.
+    let unerased_ref = e.cast::<ErrorImpl<crate::wrapper::MessageError<M>>>();
+    let object = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object) };
+    LayerInfo {
+        kind: LayerKind::Cause,
+        type_id: TypeId::of::<M>(),
+        type_name: type_name::<M>(),
+        payload: Ref::from_raw(unsafe { NonNull::new_unchecked(object.cast_mut()) }).cast::<()>(),
+        next: None,
+        inline_source: None,
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<DisplayError<M>>.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+unsafe fn display_layer<M>(e: Ref<ErrorImpl>) -> LayerInfo
+where
+    M: 'static,
+{
+    // Safety: DisplayError is repr(transparent) so a pointer to the
+    // DisplayError<M> is equally a pointer to the M it wraps.
+    let unerased_ref = e.cast::<ErrorImpl<crate::wrapper::DisplayError<M>>>();
+    let object = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object) };
+    LayerInfo {
+        kind: LayerKind::Cause,
+        type_id: TypeId::of::<M>(),
+        type_name: type_name::<M>(),
+        payload: Ref::from_raw(unsafe { NonNull::new_unchecked(object.cast_mut()) }).cast::<()>(),
+        next: None,
+        inline_source: None,
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<ContextError<C, E>>.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+unsafe fn context_layer<C, E>(e: Ref<ErrorImpl>) -> LayerInfo
+where
+    C: 'static,
+    E: 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<ContextError<C, E>>>();
+    let context = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object.context) };
+    let source = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object.error) };
+    LayerInfo {
+        kind: LayerKind::Context,
+        type_id: TypeId::of::<C>(),
+        type_name: type_name::<C>(),
+        payload: Ref::from_raw(unsafe { NonNull::new_unchecked(context.cast_mut()) }).cast::<()>(),
+        // The cause E is a plain std error, not an anyhow::Error, so it is
+        // reached through the layer's StdError::source rather than through
+        // another ErrorImpl.
+        next: None,
+        inline_source: Some(TypedPayload {
+            type_id: TypeId::of::<E>(),
+            type_name: type_name::<E>(),
+            payload: Ref::from_raw(unsafe { NonNull::new_unchecked(source.cast_mut()) })
+                .cast::<()>(),
+        }),
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<ContextError<C, Error>>.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+unsafe fn context_chain_layer<C>(e: Ref<ErrorImpl>) -> LayerInfo
+where
+    C: 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<ContextError<C, Error>>>();
+    let context = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object.context) };
+    let next = unsafe { unerased_ref.deref() }._object.error.inner.by_ref();
+    LayerInfo {
+        kind: LayerKind::Context,
+        type_id: TypeId::of::<C>(),
+        type_name: type_name::<C>(),
+        payload: Ref::from_raw(unsafe { NonNull::new_unchecked(context.cast_mut()) }).cast::<()>(),
+        next: Some(next),
+        inline_source: None,
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<BoxedError>.
+#[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+unsafe fn boxed_layer(e: Ref<ErrorImpl>) -> LayerInfo {
+    // Safety: BoxedError is repr(transparent) so a pointer to the BoxedError
+    // is equally a pointer to the Box<dyn StdError + Send + Sync> it wraps.
+    let unerased_ref = e.cast::<ErrorImpl<crate::wrapper::BoxedError>>();
+    let object = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object) };
+    LayerInfo {
+        kind: LayerKind::Cause,
+        type_id: TypeId::of::<Box<dyn StdError + Send + Sync>>(),
+        type_name: type_name::<Box<dyn StdError + Send + Sync>>(),
+        payload: Ref::from_raw(unsafe { NonNull::new_unchecked(object.cast_mut()) }).cast::<()>(),
+        next: None,
+        inline_source: None,
+    }
 }
 
 // Safety: requires layout of *e to match ErrorImpl<ContextError<C, E>>.
@@ -983,6 +1175,11 @@ impl ErrorImpl {
     #[cold]
     pub(crate) unsafe fn chain(this: Ref<Self>) -> Chain {
         Chain::new(unsafe { Self::error(this) })
+    }
+
+    #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+    pub(crate) unsafe fn layer(this: Ref<Self>) -> LayerInfo {
+        unsafe { (vtable(this.ptr).object_layer)(this) }
     }
 }
 
