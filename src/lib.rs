@@ -255,6 +255,8 @@ mod context;
 mod ensure;
 mod error;
 mod fmt;
+#[cfg(feature = "std")]
+pub mod handoff;
 mod kind;
 mod macros;
 #[cfg(error_generic_member_access)]
