@@ -285,6 +285,8 @@ trait StdError: Debug + Display {
 #[doc(no_inline)]
 pub use anyhow as format_err;
 
+pub use crate::context::ContextFactoryError;
+
 /// The `Error` type, a wrapper around a dynamic error type.
 ///
 /// `Error` works a lot like `Box<dyn std::error::Error>`, but with these
@@ -625,6 +627,98 @@ pub trait Context<T, E>: context::private::Sealed {
     where
         C: Display + Send + Sync + 'static,
         F: FnOnce() -> C;
+
+    /// Wrap the error value with additional context produced by a fallible
+    /// context factory that has already been evaluated.
+    ///
+    /// This behaves like [`Context::context`] when the factory output is
+    /// `Ok`. When the factory output is `Err`, the original error is kept as
+    /// the downcastable root cause and the factory's failure reason is stored
+    /// alongside it in a [`ContextFactoryError`] context layer, so neither
+    /// cause is lost.
+    ///
+    /// On `Ok(self)` the factory output is ignored entirely.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use anyhow::{Context, Result};
+    ///
+    /// fn context_for(key: &str) -> Result<String> {
+    ///     # const IGNORE: &str = stringify! {
+    ///     ...
+    ///     # };
+    ///     # Ok(format!("key={key}"))
+    /// }
+    ///
+    /// fn lookup(key: &str) -> Result<String> {
+    ///     # const IGNORE: &str = stringify! {
+    ///     ...
+    ///     # };
+    ///     # anyhow::bail!("missing")
+    /// }
+    ///
+    /// fn demo() -> Result<()> {
+    ///     let key = "id";
+    ///     let value = lookup(key).try_context(context_for(key))?;
+    ///     # const IGNORE: &str = stringify! {
+    ///     ...
+    ///     # };
+    ///     # let _ = value;
+    ///     # Ok(())
+    /// }
+    /// ```
+    fn try_context<C, FE>(self, context: Result<C, FE>) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        FE: Display + Send + Sync + 'static;
+
+    /// Wrap the error value with additional context produced by a fallible
+    /// context factory that is evaluated lazily, only once an error does
+    /// occur, and at most once.
+    ///
+    /// This behaves like [`Context::with_context`] when the factory returns
+    /// `Ok`. When the factory fails, the factory error does **not** replace
+    /// the business root cause: the original error remains downcastable and
+    /// the factory's failure reason is preserved separately in a
+    /// [`ContextFactoryError`] context layer, so both causes can be inspected.
+    ///
+    /// On `Ok(self)` the factory is never called.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use anyhow::{Context, Result};
+    ///
+    /// fn describe_missing(key: &str) -> Result<String> {
+    ///     # const IGNORE: &str = stringify! {
+    ///     ...
+    ///     # };
+    ///     # Ok(format!("key={key}"))
+    /// }
+    ///
+    /// fn lookup(key: &str) -> Result<String> {
+    ///     # const IGNORE: &str = stringify! {
+    ///     ...
+    ///     # };
+    ///     # anyhow::bail!("missing")
+    /// }
+    ///
+    /// fn demo() -> Result<()> {
+    ///     let key = "id";
+    ///     let value = lookup(key).try_with_context(|| describe_missing(key))?;
+    ///     # const IGNORE: &str = stringify! {
+    ///     ...
+    ///     # };
+    ///     # let _ = value;
+    ///     # Ok(())
+    /// }
+    /// ```
+    fn try_with_context<C, F, FE>(self, f: F) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> Result<C, FE>,
+        FE: Display + Send + Sync + 'static;
 }
 
 /// Equivalent to `Ok::<_, anyhow::Error>(value)`.

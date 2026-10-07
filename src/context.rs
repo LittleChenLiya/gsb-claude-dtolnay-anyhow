@@ -65,6 +65,37 @@ where
             Err(error) => Err(error.ext_context(context())),
         }
     }
+
+    fn try_context<C, FE>(self, context: Result<C, FE>) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        FE: Display + Send + Sync + 'static,
+    {
+        // Not using map_err to save 2 useless frames off the captured backtrace
+        // in ext_context.
+        match self {
+            Ok(ok) => Ok(ok),
+            Err(error) => Err(match context {
+                Ok(context) => error.ext_context(context),
+                Err(factory_error) => error.ext_context(ContextFactoryError { factory_error }),
+            }),
+        }
+    }
+
+    fn try_with_context<C, F, FE>(self, context: F) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> Result<C, FE>,
+        FE: Display + Send + Sync + 'static,
+    {
+        match self {
+            Ok(ok) => Ok(ok),
+            Err(error) => Err(match context() {
+                Ok(context) => error.ext_context(context),
+                Err(factory_error) => error.ext_context(ContextFactoryError { factory_error }),
+            }),
+        }
+    }
 }
 
 /// ```
@@ -108,6 +139,43 @@ impl<T> Context<T, Infallible> for Option<T> {
         match self {
             Some(ok) => Ok(ok),
             None => Err(Error::construct_from_display(context(), backtrace!())),
+        }
+    }
+
+    fn try_context<C, FE>(self, context: Result<C, FE>) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        FE: Display + Send + Sync + 'static,
+    {
+        // Not using ok_or_else to save 2 useless frames off the captured
+        // backtrace.
+        match self {
+            Some(ok) => Ok(ok),
+            None => Err(match context {
+                Ok(context) => Error::construct_from_display(context, backtrace!()),
+                Err(factory_error) => Error::construct_from_display(
+                    ContextFactoryError { factory_error },
+                    backtrace!(),
+                ),
+            }),
+        }
+    }
+
+    fn try_with_context<C, F, FE>(self, context: F) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        F: FnOnce() -> Result<C, FE>,
+        FE: Display + Send + Sync + 'static,
+    {
+        match self {
+            Some(ok) => Ok(ok),
+            None => Err(match context() {
+                Ok(context) => Error::construct_from_display(context, backtrace!()),
+                Err(factory_error) => Error::construct_from_display(
+                    ContextFactoryError { factory_error },
+                    backtrace!(),
+                ),
+            }),
         }
     }
 }
@@ -190,4 +258,69 @@ pub(crate) mod private {
 
     impl<T, E> Sealed for Result<T, E> where E: ext::StdError {}
     impl<T> Sealed for Option<T> {}
+}
+
+/// Context attached by [`Context::try_context`] and
+/// [`Context::try_with_context`] when the context factory itself fails.
+///
+/// This is stored as an additional context layer *around* the original
+/// error, so the business root cause remains available for
+/// [`Error::downcast`](crate::Error::downcast) while the factory's failure
+/// reason is preserved separately inside this layer. Both causes can be
+/// inspected independently:
+///
+/// ```
+/// # use anyhow::{Context, ContextFactoryError};
+/// # use std::io;
+/// let result: anyhow::Result<()> = Err(io::Error::new(io::ErrorKind::Other, "boom").into());
+/// let err = result
+///     .try_with_context(|| -> Result<&'static str, io::Error> {
+///         Err(io::Error::new(io::ErrorKind::NotFound, "no metadata"))
+///     })
+///     .unwrap_err();
+///
+/// // The original error is still the downcastable root cause.
+/// assert!(err.downcast_ref::<io::Error>().is_some());
+///
+/// // The factory failure is stored alongside, not in place of it.
+/// let note = err
+///     .downcast_ref::<ContextFactoryError<io::Error>>()
+///     .unwrap();
+/// assert_eq!(note.factory_error().kind(), io::ErrorKind::NotFound);
+/// ```
+pub struct ContextFactoryError<F> {
+    pub(crate) factory_error: F,
+}
+
+impl<F> ContextFactoryError<F> {
+    /// The error reported by the fallible context factory, preserved
+    /// alongside (never instead of) the original error.
+    pub fn factory_error(&self) -> &F {
+        &self.factory_error
+    }
+
+    /// Unwrap this context layer, returning the factory's failure reason.
+    pub fn into_factory_error(self) -> F {
+        self.factory_error
+    }
+}
+
+impl<F> Debug for ContextFactoryError<F>
+where
+    F: Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("ContextFactoryError")
+            .field("factory_error", &Quoted(&self.factory_error))
+            .finish()
+    }
+}
+
+impl<F> Display for ContextFactoryError<F>
+where
+    F: Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "failed to produce error context: {}", self.factory_error,)
+    }
 }
