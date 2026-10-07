@@ -243,6 +243,46 @@ impl Error {
         unsafe { Error::construct(error, vtable, backtrace) }
     }
 
+    // Constructs an Error in which the business `error` stays the outer (root)
+    // error, while `factory_error` (the reason context attachment failed) is
+    // stashed in a side channel reachable through downcast but not through
+    // source(). Used by `Context::with_fallible_context`.
+    #[cfg(all(
+        feature = "fallible-context",
+        any(feature = "std", not(anyhow_no_core_error))
+    ))]
+    #[cold]
+    pub(crate) fn construct_from_fail_context<E, F>(
+        error: E,
+        factory_error: F,
+        backtrace: Option<Backtrace>,
+    ) -> Self
+    where
+        E: StdError + Send + Sync + 'static,
+        F: StdError + Send + Sync + 'static,
+    {
+        let error: FailContextError<E, F> = FailContextError {
+            error,
+            factory_error,
+        };
+
+        let vtable = &ErrorVTable {
+            object_drop: object_drop::<FailContextError<E, F>>,
+            object_ref: object_ref::<FailContextError<E, F>>,
+            #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+            object_boxed: object_boxed::<FailContextError<E, F>>,
+            #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+            object_reallocate_boxed: object_reallocate_boxed::<FailContextError<E, F>>,
+            object_downcast: fail_context_downcast::<E, F>,
+            object_drop_rest: fail_context_drop_rest::<E, F>,
+            #[cfg(all(not(error_generic_member_access), feature = "std"))]
+            object_backtrace: no_backtrace,
+        };
+
+        // Safety: passing vtable that operates on the right type.
+        unsafe { Error::construct(error, vtable, backtrace) }
+    }
+
     #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
     #[cold]
     pub(crate) fn construct_from_boxed(
@@ -381,6 +421,63 @@ impl Error {
 
         // Safety: passing vtable that operates on the right type.
         unsafe { Error::construct(error, vtable, backtrace) }
+    }
+
+    /// Attach the context produced by a fallible factory, preserving this
+    /// error if the factory itself fails.
+    ///
+    /// This is the fallible counterpart of [`Error::context`] /
+    /// [`Error::with_context`][crate::Context::with_context]. On
+    /// <code>Ok(context)</code> the context is attached exactly as by
+    /// `context`. On `Err(factory_error)`, this original error is **not**
+    /// replaced: it remains the outer error and the root of the source chain
+    /// (so existing downcasts keep working), while `factory_error` is stored
+    /// in a side channel where it can be retrieved with
+    /// [`downcast_ref`][Error::downcast_ref] but does not appear in
+    /// [`chain`][Error::chain].
+    ///
+    /// Prefer [`Context::with_fallible_context`] for attaching context to a
+    /// `Result`; this inherent method is useful when you already hold an
+    /// `anyhow::Error`.
+    #[cfg(all(
+        feature = "fallible-context",
+        any(feature = "std", not(anyhow_no_core_error))
+    ))]
+    #[cold]
+    pub fn fail_context<C, F, G>(self, factory: G) -> Self
+    where
+        C: Display + Send + Sync + 'static,
+        F: StdError + Send + Sync + 'static,
+        G: FnOnce() -> Result<C, F>,
+    {
+        match factory() {
+            Ok(context) => self.context(context),
+            Err(factory_error) => {
+                let error: FailContextChainError<F> = FailContextChainError {
+                    error: self,
+                    factory_error,
+                };
+
+                let vtable = &ErrorVTable {
+                    object_drop: object_drop::<FailContextChainError<F>>,
+                    object_ref: object_ref::<FailContextChainError<F>>,
+                    #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+                    object_boxed: object_boxed::<FailContextChainError<F>>,
+                    #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
+                    object_reallocate_boxed: object_reallocate_boxed::<FailContextChainError<F>>,
+                    object_downcast: fail_chain_downcast::<F>,
+                    object_drop_rest: fail_chain_drop_rest::<F>,
+                    #[cfg(all(not(error_generic_member_access), feature = "std"))]
+                    object_backtrace: fail_chain_backtrace::<F>,
+                };
+
+                // As the cause is anyhow::Error, we already have a backtrace.
+                let backtrace = None;
+
+                // Safety: passing vtable that operates on the right type.
+                unsafe { Error::construct(error, vtable, backtrace) }
+            }
+        }
     }
 
     /// Get the backtrace for this Error.
@@ -901,6 +998,118 @@ where
     Some(backtrace)
 }
 
+// Safety: requires layout of *e to match ErrorImpl<FailContextError<E, F>>.
+#[cfg(all(
+    feature = "fallible-context",
+    any(feature = "std", not(anyhow_no_core_error))
+))]
+unsafe fn fail_context_downcast<E, F>(e: Ref<ErrorImpl>, target: TypeId) -> Option<Ref<()>>
+where
+    E: 'static,
+    F: 'static,
+{
+    // Downcasting reaches both the retained business error E and the stashed
+    // factory error F, but never any source below E: the factory failure must
+    // not be mistaken for, nor replace, the business root cause.
+    if TypeId::of::<E>() == target {
+        let unerased_ref = e.cast::<ErrorImpl<FailContextError<E, F>>>();
+        let inner = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object.error) };
+        Some(Ref::from_raw(unsafe { NonNull::new_unchecked(inner.cast_mut()) }).cast::<()>())
+    } else if TypeId::of::<F>() == target {
+        let unerased_ref = e.cast::<ErrorImpl<FailContextError<E, F>>>();
+        let inner = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object.factory_error) };
+        Some(Ref::from_raw(unsafe { NonNull::new_unchecked(inner.cast_mut()) }).cast::<()>())
+    } else {
+        None
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<FailContextError<E, F>>.
+#[cfg(all(
+    feature = "fallible-context",
+    any(feature = "std", not(anyhow_no_core_error))
+))]
+unsafe fn fail_context_drop_rest<E, F>(e: Own<ErrorImpl>, target: TypeId)
+where
+    E: 'static,
+    F: 'static,
+{
+    // Called after downcasting by value to either the business error E or the
+    // factory error F and doing a ptr::read to take ownership of that value.
+    if TypeId::of::<E>() == target {
+        let unerased_own = e.cast::<ErrorImpl<FailContextError<ManuallyDrop<E>, F>>>();
+        drop(unsafe { unerased_own.boxed() });
+    } else {
+        let unerased_own = e.cast::<ErrorImpl<FailContextError<E, ManuallyDrop<F>>>>();
+        drop(unsafe { unerased_own.boxed() });
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<FailContextChainError<F>>.
+#[cfg(all(
+    feature = "fallible-context",
+    any(feature = "std", not(anyhow_no_core_error))
+))]
+unsafe fn fail_chain_downcast<F>(e: Ref<ErrorImpl>, target: TypeId) -> Option<Ref<()>>
+where
+    F: 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<FailContextChainError<F>>>();
+    if TypeId::of::<F>() == target {
+        let inner = unsafe { ptr::addr_of!((*unerased_ref.as_ptr())._object.factory_error) };
+        Some(Ref::from_raw(unsafe { NonNull::new_unchecked(inner.cast_mut()) }).cast::<()>())
+    } else {
+        // The business error is an anyhow::Error: recurse into its own vtable
+        // so its context chain and original downcasts remain fully intact.
+        let unerased = unsafe { unerased_ref.deref() };
+        let source = &unerased._object.error;
+        unsafe { (vtable(source.inner.ptr).object_downcast)(source.inner.by_ref(), target) }
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<FailContextChainError<F>>.
+#[cfg(all(
+    feature = "fallible-context",
+    any(feature = "std", not(anyhow_no_core_error))
+))]
+unsafe fn fail_chain_drop_rest<F>(e: Own<ErrorImpl>, target: TypeId)
+where
+    F: 'static,
+{
+    // Called after downcasting by value to the factory error F, or to one of
+    // the causes inside the business anyhow::Error, and ptr::reading it.
+    if TypeId::of::<F>() == target {
+        let unerased_own = e.cast::<ErrorImpl<FailContextChainError<ManuallyDrop<F>>>>();
+        // Drop the entire rest of the data structure rooted in the next Error.
+        drop(unsafe { unerased_own.boxed() });
+    } else {
+        let unerased_own = e.cast::<ErrorImpl<ContextError<ManuallyDrop<F>, Error>>>();
+        let unerased = unsafe { unerased_own.boxed() };
+        // Read the Own<ErrorImpl> from the next error.
+        let inner = unerased._object.error.inner;
+        drop(unerased);
+        let vtable = unsafe { vtable(inner.ptr) };
+        // Recursively drop the next error using the same target typeid.
+        unsafe { (vtable.object_drop_rest)(inner, target) };
+    }
+}
+
+// Safety: requires layout of *e to match ErrorImpl<FailContextChainError<F>>.
+#[cfg(all(
+    feature = "fallible-context",
+    not(error_generic_member_access),
+    feature = "std"
+))]
+unsafe fn fail_chain_backtrace<F>(e: Ref<ErrorImpl>) -> Option<&Backtrace>
+where
+    F: 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<FailContextChainError<F>>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    let backtrace = unsafe { ErrorImpl::backtrace(unerased._object.error.inner.by_ref()) };
+    Some(backtrace)
+}
+
 // NOTE: If working with `ErrorImpl<()>`, references should be avoided in favor
 // of raw pointers and `NonNull`.
 // repr C to ensure that E remains in the final position.
@@ -926,6 +1135,34 @@ unsafe fn vtable(p: NonNull<ErrorImpl>) -> &'static ErrorVTable {
 pub(crate) struct ContextError<C, E> {
     pub context: C,
     pub error: E,
+}
+
+// repr C so that the two fields stay in a known order when either one is
+// wrapped in ManuallyDrop during downcast_by_value (see fail_context_drop_rest).
+//
+// `error` is the original business error and remains the root of the source
+// chain; `factory_error` is the reason why context attachment failed and is
+// stored separately, reachable only via downcast rather than source().
+#[cfg(all(
+    feature = "fallible-context",
+    any(feature = "std", not(anyhow_no_core_error))
+))]
+#[repr(C)]
+pub(crate) struct FailContextError<E, F> {
+    pub error: E,
+    pub factory_error: F,
+}
+
+// Same idea as FailContextError, but the business error is itself an
+// anyhow::Error whose own cause chain must continue to be traversable.
+#[cfg(all(
+    feature = "fallible-context",
+    any(feature = "std", not(anyhow_no_core_error))
+))]
+#[repr(C)]
+pub(crate) struct FailContextChainError<F> {
+    pub error: Error,
+    pub factory_error: F,
 }
 
 impl<E> ErrorImpl<E> {

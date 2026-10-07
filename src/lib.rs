@@ -625,6 +625,70 @@ pub trait Context<T, E>: context::private::Sealed {
     where
         C: Display + Send + Sync + 'static,
         F: FnOnce() -> C;
+
+    /// Wrap the error value with context produced by a fallible factory.
+    ///
+    /// Like [`with_context`][Context::with_context], the closure `f` is called
+    /// at most once, and **not at all** when the result is `Ok`. Unlike
+    /// `with_context`, the factory may itself fail:
+    ///
+    /// - If it returns <code>Ok(context)</code>, that context is attached to
+    ///   the original error exactly as with `with_context`.
+    /// - If it returns <code>Err(factory_error)</code>, the original business
+    ///   error is **kept** as the outer error and the root of the source chain
+    ///   (so downcasts that worked before still work). The factory's error is
+    ///   stored in a separate side channel: it is reachable with
+    ///   [`Error::downcast_ref`] but intentionally does not replace the
+    ///   business root cause and does not appear in [`Error::chain`].
+    ///
+    /// This method is only available when the crate is built with the
+    /// non-default `fallible-context` feature.
+    ///
+    /// ```
+    /// # #[cfg(feature = "fallible-context")]
+    /// # fn demo() -> anyhow::Result<()> {
+    /// use anyhow::Context;
+    /// use std::fmt::{self, Display};
+    ///
+    /// #[derive(Debug)]
+    /// struct BusinessError;
+    /// impl Display for BusinessError {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         write!(f, "business failed")
+    ///     }
+    /// }
+    /// impl std::error::Error for BusinessError {}
+    ///
+    /// #[derive(Debug)]
+    /// struct ContextBuildError;
+    /// impl Display for ContextBuildError {
+    ///     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    ///         write!(f, "could not build context")
+    ///     }
+    /// }
+    /// impl std::error::Error for ContextBuildError {}
+    ///
+    /// let result: Result<(), BusinessError> = Err(BusinessError);
+    /// let error = result
+    ///     .with_fallible_context(|| Err::<&str, ContextBuildError>(ContextBuildError))
+    ///     .unwrap_err();
+    ///
+    /// // The business root cause survives and is still downcastable.
+    /// assert!(error.downcast_ref::<BusinessError>().is_some());
+    /// // The factory failure is stashed separately and is also downcastable.
+    /// assert!(error.downcast_ref::<ContextBuildError>().is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(all(
+        feature = "fallible-context",
+        any(feature = "std", not(anyhow_no_core_error))
+    ))]
+    fn with_fallible_context<C, F, G>(self, f: G) -> Result<T, Error>
+    where
+        C: Display + Send + Sync + 'static,
+        F: StdError + Send + Sync + 'static,
+        G: FnOnce() -> Result<C, F>;
 }
 
 /// Equivalent to `Ok::<_, anyhow::Error>(value)`.

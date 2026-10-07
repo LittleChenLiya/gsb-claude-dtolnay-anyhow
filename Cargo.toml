@@ -17,6 +17,12 @@ std = []
 # THIS HAS NO EFFECT. This feature remains to preserve compatibility with the
 # old `backtrace` optional dependency that this crate used to have.
 backtrace = []
+# Enables `Context::with_fallible_context`, which attaches context produced by
+# a fallible factory. If the factory fails, the original business error is
+# retained as the root cause (still downcastable) and the factory's error is
+# stored alongside it instead of replacing it. Disabled by default; without it
+# the crate's API is unchanged.
+fallible-context = []
 
 [dev-dependencies]
 futures = { version = "0.3", default-features = false }
