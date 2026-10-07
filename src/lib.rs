@@ -257,6 +257,7 @@ mod error;
 mod fmt;
 mod kind;
 mod macros;
+mod multierror;
 #[cfg(error_generic_member_access)]
 mod nightly;
 mod ptr;
@@ -415,6 +416,9 @@ pub struct Error {
 pub struct Chain<'a> {
     state: crate::chain::ChainState<'a>,
 }
+
+#[doc(no_inline)]
+pub use crate::multierror::{EmptyErrors, MultiError};
 
 /// `Result<T, Error>`
 ///
