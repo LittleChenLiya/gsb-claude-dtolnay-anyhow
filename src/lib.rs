@@ -262,6 +262,12 @@ mod nightly;
 mod ptr;
 mod wrapper;
 
+#[cfg(feature = "std")]
+mod index;
+
+#[cfg(feature = "std")]
+pub use crate::index::{ChainIndex, ChainReport, EmptyChain, Layer, LayerKind, LayerReport, Layers, WalkStatus};
+
 use crate::error::ErrorImpl;
 use crate::ptr::Own;
 use core::fmt::Display;

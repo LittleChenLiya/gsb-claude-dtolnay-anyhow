@@ -5,6 +5,8 @@ use crate::nightly::{self, Request};
 #[cfg(any(feature = "std", not(anyhow_no_core_error)))]
 use crate::ptr::Mut;
 use crate::ptr::{Own, Ref};
+#[cfg(feature = "std")]
+use crate::wrapper;
 use crate::{Error, StdError};
 use alloc::boxed::Box;
 use core::any::TypeId;
@@ -157,6 +159,8 @@ impl Error {
             object_drop_rest: object_drop_front::<E>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
+            #[cfg(feature = "std")]
+            object_index: object_index_std::<E>,
         };
 
         // Safety: passing vtable that operates on the right type E.
@@ -181,6 +185,8 @@ impl Error {
             object_drop_rest: object_drop_front::<M>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
+            #[cfg(feature = "std")]
+            object_index: object_index_adhoc::<M>,
         };
 
         // Safety: MessageError is repr(transparent) so it is okay for the
@@ -206,6 +212,8 @@ impl Error {
             object_drop_rest: object_drop_front::<M>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
+            #[cfg(feature = "std")]
+            object_index: object_index_display::<M>,
         };
 
         // Safety: DisplayError is repr(transparent) so it is okay for the
@@ -237,6 +245,8 @@ impl Error {
             object_drop_rest: context_drop_rest::<C, E>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
+            #[cfg(feature = "std")]
+            object_index: object_index_context_plain::<C, E>,
         };
 
         // Safety: passing vtable that operates on the right type.
@@ -262,6 +272,8 @@ impl Error {
             object_drop_rest: object_drop_front::<Box<dyn StdError + Send + Sync>>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: no_backtrace,
+            #[cfg(feature = "std")]
+            object_index: object_index_boxed,
         };
 
         // Safety: BoxedError is repr(transparent) so it is okay for the vtable
@@ -374,6 +386,8 @@ impl Error {
             object_drop_rest: context_chain_drop_rest::<C>,
             #[cfg(all(not(error_generic_member_access), feature = "std"))]
             object_backtrace: context_backtrace::<C>,
+            #[cfg(feature = "std")]
+            object_index: object_index_context_chain::<C>,
         };
 
         // As the cause is anyhow::Error, we already have a backtrace for it.
@@ -440,6 +454,48 @@ impl Error {
     #[cold]
     pub fn chain(&self) -> Chain {
         unsafe { ErrorImpl::chain(self.inner.by_ref()) }
+    }
+
+    /// Build a read-only [`ChainIndex`] over this error's context layers and
+    /// underlying causes.
+    ///
+    /// The index borrows `self`; the error is not taken or mutated and stays
+    /// usable afterward. Layers are identified by their concrete
+    /// [`TypeId`][core::any::TypeId], never by their `Display` text, and context
+    /// layers are distinguished from the bottom cause. Multiple contexts of the
+    /// same type are each retained in attach order. Walking a custom `source`
+    /// chain is depth-bounded and cycle-safe, so a self-referential source does
+    /// not hang.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use anyhow::{anyhow, Context};
+    /// use std::io;
+    ///
+    /// #[derive(Debug)]
+    /// struct Retry;
+    /// impl std::fmt::Display for Retry {
+    ///     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    ///         f.write_str("retry")
+    ///     }
+    /// }
+    ///
+    /// let error = anyhow!(io::Error::new(io::ErrorKind::Other, "io failed"))
+    ///     .context(Retry);
+    /// let index = error.chain_index();
+    /// assert_eq!(index.contexts::<Retry>().len(), 1);
+    /// // The original io::Error is still in place: indexing does not take it.
+    /// assert!(index.cause_ref::<io::Error>().is_some());
+    /// assert_eq!(error.to_string(), "retry");
+    /// ```
+    #[cfg(feature = "std")]
+    pub fn chain_index(&self) -> crate::index::ChainIndex<'_> {
+        let mut walker = crate::index::Walker::new();
+        unsafe {
+            (vtable(self.inner.ptr).object_index)(self.inner.by_ref(), &mut walker);
+        }
+        walker.finish()
     }
 
     /// The lowest level cause of this error &mdash; this error's cause's
@@ -730,6 +786,13 @@ struct ErrorVTable {
     object_drop_rest: unsafe fn(Own<ErrorImpl>, TypeId),
     #[cfg(all(not(error_generic_member_access), feature = "std"))]
     object_backtrace: unsafe fn(Ref<ErrorImpl>) -> Option<&Backtrace>,
+    // Feed this error's structurally known layers (context values and the held
+    // value) into a chain index builder, then let the builder bounded-walk any
+    // user-provided `source` links. Only present under std, like ChainIndex.
+    // The two lifetimes are tied: references pushed into the walker borrow from
+    // this ErrorImpl.
+    #[cfg(feature = "std")]
+    object_index: for<'a> unsafe fn(Ref<'a, ErrorImpl>, &mut crate::index::Walker<'a>),
 }
 
 // Safety: requires layout of *e to match ErrorImpl<E>.
@@ -899,6 +962,104 @@ where
     let unerased = unsafe { unerased_ref.deref() };
     let backtrace = unsafe { ErrorImpl::backtrace(unerased._object.error.inner.by_ref()) };
     Some(backtrace)
+}
+
+// Safety: requires layout of *e to match ErrorImpl<E> where E: StdError.
+#[cfg(feature = "std")]
+unsafe fn object_index_std<'a, E>(
+    e: Ref<'a, ErrorImpl>,
+    walker: &mut crate::index::Walker<'a>,
+) where
+    E: StdError + Send + Sync + 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<E>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    let value = &unerased._object;
+    // The held value is a cause; its concrete type is known and remains
+    // downcastable. Walker bounded-walks value.source() from here.
+    walker.begin_cause(Some(value), Some(value));
+}
+
+// Safety: requires layout of *e to match ErrorImpl<MessageError<M>>.
+#[cfg(feature = "std")]
+unsafe fn object_index_adhoc<'a, M>(
+    e: Ref<'a, ErrorImpl>,
+    walker: &mut crate::index::Walker<'a>,
+) where
+    M: Display + Debug + Send + Sync + 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<wrapper::MessageError<M>>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    // Adhoc messages downcast to the inner M per Anyhow's existing semantics.
+    let value = &unerased._object.0;
+    let error = &unerased._object;
+    walker.begin_cause(Some(value), Some(error));
+}
+
+// Safety: requires layout of *e to match ErrorImpl<DisplayError<M>>.
+#[cfg(feature = "std")]
+unsafe fn object_index_display<'a, M>(
+    e: Ref<'a, ErrorImpl>,
+    walker: &mut crate::index::Walker<'a>,
+) where
+    M: Display + Send + Sync + 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<wrapper::DisplayError<M>>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    // Option::None.context(...) holds a DisplayError; the inner M is the
+    // directly held, downcastable value. It has no further source.
+    let value = &unerased._object.0;
+    let error = &unerased._object;
+    walker.begin_cause(Some(value), Some(error));
+}
+
+// Safety: requires layout of *e to match ErrorImpl<ContextError<C, E>>.
+#[cfg(feature = "std")]
+unsafe fn object_index_context_plain<'a, C, E>(
+    e: Ref<'a, ErrorImpl>,
+    walker: &mut crate::index::Walker<'a>,
+) where
+    C: Display + Send + Sync + 'static,
+    E: StdError + Send + Sync + 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<ContextError<C, E>>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    // Record the attached context by its real value identity first, then
+    // descend into the cause that the context wraps.
+    walker.context(&unerased._object.context);
+    let error = &unerased._object.error;
+    walker.begin_cause(Some(error), Some(error));
+}
+
+// Safety: requires layout of *e to match ErrorImpl<BoxedError>.
+#[cfg(feature = "std")]
+unsafe fn object_index_boxed<'a>(
+    e: Ref<'a, ErrorImpl>,
+    walker: &mut crate::index::Walker<'a>,
+) {
+    let unerased_ref = e.cast::<ErrorImpl<wrapper::BoxedError>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    // The boxed trait object's concrete payload is not statically nameable
+    // here (downcasting a boxed dyn error is intentionally unsupported), so the
+    // cause layer has no known identity; start bounded-walking at its source.
+    walker.begin_dyn_cause(Some(&*unerased._object.0));
+}
+
+// Safety: requires layout of *e to match ErrorImpl<ContextError<C, Error>>.
+#[cfg(feature = "std")]
+unsafe fn object_index_context_chain<'a, C>(
+    e: Ref<'a, ErrorImpl>,
+    walker: &mut crate::index::Walker<'a>,
+) where
+    C: Display + Send + Sync + 'static,
+{
+    let unerased_ref = e.cast::<ErrorImpl<ContextError<C, Error>>>();
+    let unerased = unsafe { unerased_ref.deref() };
+    // Context layers record in outer-to-inner order: push this context, then
+    // recurse into the inner Anyhow error's vtable.
+    walker.context(&unerased._object.context);
+    let source = &unerased._object.error;
+    unsafe { (vtable(source.inner.ptr).object_index)(source.inner.by_ref(), walker) };
 }
 
 // NOTE: If working with `ErrorImpl<()>`, references should be avoided in favor
