@@ -257,6 +257,7 @@ mod error;
 mod fmt;
 mod kind;
 mod macros;
+mod multierror;
 #[cfg(error_generic_member_access)]
 mod nightly;
 mod ptr;
@@ -264,6 +265,7 @@ mod wrapper;
 
 use crate::error::ErrorImpl;
 use crate::ptr::Own;
+use alloc::vec::Vec;
 use core::fmt::Display;
 
 #[cfg(all(not(feature = "std"), anyhow_no_core_error))]
@@ -414,6 +416,50 @@ pub struct Error {
 #[derive(Clone)]
 pub struct Chain<'a> {
     state: crate::chain::ChainState<'a>,
+}
+
+/// A small owning container of multiple independent [`Error`]s.
+///
+/// `MultiError` holds two or more (or just one) anyhow errors that were
+/// produced independently, for example while processing the elements of a
+/// batch. Each element keeps its own context chain and downcast ability,
+/// exactly as if it were still a standalone `Error`.
+///
+/// - [`MultiError::source`][std::error::Error::source] points at the
+///   explicitly selected first error, whose own `source` chain keeps that
+///   error's context reachable.
+/// - [`MultiError::iter`] borrows every error in its original order.
+/// - [`MultiError::into_errors`] consumes the container and moves ownership
+///   of the errors out exactly once.
+/// - An empty set of errors is not a failure, so there is no way to
+///   construct an empty `MultiError`; [`MultiError::from_errors`] returns
+///   `None` instead.
+///
+/// # Example
+///
+/// ```
+/// use anyhow::{Context, Error, MultiError};
+///
+/// let mut errors = Vec::new();
+/// for word in ["1", "x", "2", "y"] {
+///     if let Err(err) = word.parse::<u32>() {
+///         errors.push(Error::new(err).context(format!("parsing {word:?}")));
+///     }
+/// }
+///
+/// if let Some(multi) = MultiError::from_errors(errors) {
+///     assert_eq!(multi.len(), 2);
+///     assert_eq!(multi.to_string(), "parsing \"x\" (and 1 more error)");
+///     for error in multi.iter() {
+///         eprintln!("{error:?}");
+///     }
+///     let owned: Vec<Error> = multi.into_errors();
+///     assert_eq!(owned.len(), 2);
+/// }
+/// ```
+pub struct MultiError {
+    // Invariant: never empty. An empty set of errors is not a failure.
+    errors: Vec<Error>,
 }
 
 /// `Result<T, Error>`
